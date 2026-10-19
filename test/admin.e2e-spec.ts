@@ -6,6 +6,7 @@ import request from 'supertest';
 import { AppModule } from '../src/app.module';
 import { pool } from '../src/db/pool';
 import { ReferralRewardsService } from '../src/referrals/referral-rewards.service';
+import { WithdrawalsService } from '../src/withdrawals/withdrawals.service';
 
 // The point of this feature: an admin can suspend a merchant and have it
 // actually take effect immediately — not just on the merchant's next login,
@@ -388,17 +389,26 @@ describe('admin workflow: suspend/reactivate a merchant (e2e)', () => {
   describe('referrals: attribution at signup, activation computed from real payment history', () => {
     const referrerEmail = `referrer-e2e-${Date.now()}@example.com`;
     const referredEmail = `referred-e2e-${Date.now()}@example.com`;
+    const protectedReferredEmail = `protected-referred-e2e-${Date.now()}@example.com`;
     const noCodeEmail = `no-code-e2e-${Date.now()}@example.com`;
     const stellarAddr = 'GBXBABMFZIJPTOFI6STUXA2FMEXDBB4URBD3VS5XDHKMFHGLJZ5WPQBB';
     let referrerId: string;
     let referrerCode: string;
     let referrerCookie: string;
     let referredId: string;
+    let protectedReferredId: string;
 
     afterAll(async () => {
       await pool.query('DELETE FROM referrals WHERE referrer_id = $1 OR referred_id = $1', [referrerId]);
+      await pool.query('DELETE FROM referrals WHERE referred_id = $1', [protectedReferredId]);
       await pool.query('DELETE FROM payments WHERE merchant_id = $1', [referredId]);
-      await pool.query('DELETE FROM merchants WHERE email IN ($1, $2, $3)', [referrerEmail, referredEmail, noCodeEmail]);
+      await pool.query('DELETE FROM payments WHERE merchant_id = $1', [protectedReferredId]);
+      await pool.query('DELETE FROM merchants WHERE email IN ($1, $2, $3, $4)', [
+        referrerEmail,
+        referredEmail,
+        protectedReferredEmail,
+        noCodeEmail,
+      ]);
     });
 
     it('every new merchant gets a referral code automatically, no separate step', async () => {
@@ -526,6 +536,46 @@ describe('admin workflow: suspend/reactivate a merchant (e2e)', () => {
       const referralAgain = await pool.query('SELECT reward_granted_at FROM referrals WHERE referred_id = $1', [referredId]);
       expect(referralAgain.rows[0].reward_granted_at).toEqual(grantedAtFirst);
     });
+
+    it('does not downgrade a more favorable active promo when another referral activates', async () => {
+      const signup = await request(app.getHttpServer())
+        .post('/auth/signup')
+        .send({
+          email: protectedReferredEmail,
+          password: 'a-real-password-000',
+          name: 'Protected Referred Merchant',
+          stellar_base_address: stellarAddr,
+          referral_code: referrerCode,
+        })
+        .expect(201);
+      protectedReferredId = signup.body.merchant.id;
+
+      await pool.query(
+        `INSERT INTO payments (merchant_id, muxed_id, muxed_address, payer_address, asset_code, amount_usdc, net_usdc, status, paging_token, tx_hash, ledger_sequence)
+         VALUES ($1, 115, 'M...ref2', $2, 'USDC', 5, 5, 'paid', $3, 'e2e-referral-protected-tx', 1)`,
+        [protectedReferredId, 'GDIET4T37N35XU4FY52RMR4Z653WYFITEHGIJXN4VEQTDYR5JSURJDPL', `e2e-referral-protected-${Date.now()}`],
+      );
+      await pool.query(
+        `UPDATE merchants
+         SET promo_fee_bps = 0, promo_expires_at = NOW() + INTERVAL '30 days', promo_volume_cap_usdc = 500
+         WHERE id = $1`,
+        [referrerId],
+      );
+      const before = await pool.query(
+        'SELECT promo_fee_bps, promo_expires_at, promo_volume_cap_usdc FROM merchants WHERE id = $1',
+        [referrerId],
+      );
+
+      await app.get(ReferralRewardsService).sweep();
+
+      const after = await pool.query(
+        'SELECT promo_fee_bps, promo_expires_at, promo_volume_cap_usdc FROM merchants WHERE id = $1',
+        [referrerId],
+      );
+      expect(after.rows[0]).toEqual(before.rows[0]);
+      const referral = await pool.query('SELECT reward_granted_at FROM referrals WHERE referred_id = $1', [protectedReferredId]);
+      expect(referral.rows[0].reward_granted_at).not.toBeNull();
+    });
   });
 
   describe('reconciler: cursor can only move backward', () => {
@@ -576,14 +626,33 @@ describe('admin workflow: suspend/reactivate a merchant (e2e)', () => {
 
   describe('withdrawal attempts: admin visibility, never leaking the anchor token', () => {
     let attemptId: string;
+    let terminalAttemptId: string;
+    let recentAttemptId: string;
+    let getStatus: jest.SpyInstance;
 
     beforeAll(async () => {
       const { rows } = await pool.query(
-        `INSERT INTO withdrawal_attempts (merchant_id, currency, anchor_tx_id, token) VALUES ($1, 'XLM', 'e2e-anchor-tx-id', 'e2e-fake-token')
+        `INSERT INTO withdrawal_attempts (merchant_id, currency, anchor_tx_id, token, last_status, last_polled_at)
+         VALUES ($1, 'XLM', 'e2e-anchor-tx-id', 'e2e-fake-token', 'pending', NOW() - INTERVAL '1 minute')
          RETURNING id`,
         [merchantId],
       );
       attemptId = rows[0].id;
+      const terminal = await pool.query(
+        `INSERT INTO withdrawal_attempts (merchant_id, currency, anchor_tx_id, token, last_status)
+         VALUES ($1, 'XLM', 'e2e-terminal-anchor-tx-id', 'e2e-terminal-token', 'completed')
+         RETURNING id`,
+        [merchantId],
+      );
+      terminalAttemptId = terminal.rows[0].id;
+      const recentlyPolled = await pool.query(
+        `INSERT INTO withdrawal_attempts (merchant_id, currency, anchor_tx_id, token, last_status, last_polled_at)
+         VALUES ($1, 'XLM', 'e2e-recent-anchor-tx-id', 'e2e-recent-token', 'pending', NOW())
+         RETURNING id`,
+        [merchantId],
+      );
+      recentAttemptId = recentlyPolled.rows[0].id;
+      getStatus = jest.spyOn(app.get(WithdrawalsService), 'getStatus').mockResolvedValue({ status: 'pending' });
     });
 
     it('lists it with the merchant joined in, and never exposes the raw token', async () => {
@@ -592,6 +661,24 @@ describe('admin workflow: suspend/reactivate a merchant (e2e)', () => {
       expect(entry).toBeDefined();
       expect(entry.merchant_email).toBe(merchantEmail);
       expect(entry.token).toBeUndefined();
+      expect(getStatus).toHaveBeenCalledWith('e2e-fake-token', 'e2e-anchor-tx-id');
+      const updated = await pool.query('SELECT last_status FROM withdrawal_attempts WHERE id = $1', [attemptId]);
+      expect(updated.rows[0].last_status).toBe('pending');
+    });
+
+    it('does not refresh terminal attempts', async () => {
+      getStatus.mockClear();
+      const res = await request(app.getHttpServer()).get('/admin/withdrawal-attempts').set('Cookie', adminCookie).expect(200);
+      expect(res.body.find((a: { id: string }) => a.id === terminalAttemptId).last_status).toBe('completed');
+      expect(getStatus).not.toHaveBeenCalledWith('e2e-terminal-token', 'e2e-terminal-anchor-tx-id');
+    });
+
+    it('does not refresh attempts polled within the recent-poll window', async () => {
+      getStatus.mockClear();
+      await pool.query('UPDATE withdrawal_attempts SET last_polled_at = NOW() WHERE id = $1', [recentAttemptId]);
+      const res = await request(app.getHttpServer()).get('/admin/withdrawal-attempts').set('Cookie', adminCookie).expect(200);
+      expect(res.body.find((a: { id: string }) => a.id === recentAttemptId).last_status).toBe('pending');
+      expect(getStatus).not.toHaveBeenCalledWith('e2e-recent-token', 'e2e-recent-anchor-tx-id');
     });
   });
 });

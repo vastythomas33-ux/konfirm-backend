@@ -74,6 +74,26 @@ describe('hardening: bazaar limits and admin password reset (e2e)', () => {
     await request(app.getHttpServer()).post('/bazaar/listings').send(listing(url)).expect(409);
   });
 
+  it('admin: records bazaar moderation reasons in the activity feed', async () => {
+    const reason = 'listing does not meet the submission criteria';
+    const submission = await request(app.getHttpServer())
+      .post('/bazaar/listings')
+      .send(listing(`https://moderation-${stamp}.example.com/api`))
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .patch(`/admin/bazaar-listings/${submission.body.id}/status`)
+      .set('Cookie', adminCookie)
+      .send({ status: 'rejected', reason })
+      .expect(200);
+
+    const activity = await request(app.getHttpServer()).get('/admin/activity').set('Cookie', adminCookie).expect(200);
+    const entry = activity.body.find((action: { target_id: string }) => action.target_id === submission.body.id);
+    expect(entry).toBeDefined();
+    expect(entry.action).toBe('bazaar-listing.rejected');
+    expect(entry.detail.reason).toBe(reason);
+  });
+
   it('admin: refuses a reset without a reason', async () => {
     await request(app.getHttpServer())
       .post(`/admin/merchants/${merchantId}/password-reset`)
